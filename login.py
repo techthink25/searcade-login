@@ -270,6 +270,18 @@ def _is_on_userveria_authorize(sb: SB) -> bool:
     return "userveria.com/authorize" in _current_url(sb).lower()
 
 
+def _is_on_create_account_page(sb: SB) -> bool:
+    """userveria 在邮箱不存在/大小写不对时，会跳到 'Create your account' 页面。"""
+    try:
+        html = sb.get_page_source() or ""
+    except Exception:
+        return False
+    return (
+        "Create your account" in html
+        and 'name="password_confirmation"' in html
+    )
+
+
 # ---------- 登录步骤 ----------
 def _do_email_step(sb: SB, email: str) -> bool:
     email_sel = _first_visible(sb, EMAIL_SELECTORS, timeout_each=3)
@@ -406,6 +418,20 @@ def login_then_flow_one_account(
                 return "FAIL", _has_cf_clearance(sb), _current_url(sb), server_id, False
 
             _try_click_captcha(sb, "邮箱提交后")
+
+            # 关键：如果跳到了 userveria 的 "Create your account" 页面，
+            # 说明 userveria 这边查不到这个邮箱（大概率是 email 大小写不一致）。
+            # 此时绝不能填密码 + 提交，会被识别为创建新账号。直接报错退出。
+            if _is_on_create_account_page(sb):
+                screenshot(sb, f"create_account_detected_{int(time.time())}.png")
+                dump_html(sb, f"create_account_detected_{int(time.time())}.html")
+                print(
+                    "❌ 检测到 userveria 'Create your account' 页面：\n"
+                    "   说明这个邮箱在 userveria 里不存在，最常见原因是\n"
+                    "   ACCOUNTS_BATCH secret 里邮箱大小写写错了。\n"
+                    "   请改成你注册时实际使用的大小写形式后重试。"
+                )
+                return "FAIL", _has_cf_clearance(sb), _current_url(sb), server_id, False
 
             screenshot(sb, f"02_password_page_{int(time.time())}.png")
             dump_html(sb, f"02_password_page_{int(time.time())}.html")
