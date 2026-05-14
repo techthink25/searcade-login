@@ -36,14 +36,15 @@ jobs:
         run: |
           python login.py
 
-      # 📸 上传截图（无论成功或失败）
-      - name: 📸 Upload debug screenshots
+      # 📸 上传截图 + HTML（无论成功或失败）
+      - name: 📸 Upload debug artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: searcade-screenshots
+          name: searcade-debug
           path: |
             screenshots/*.png
+            screenshots/*.html
 
       # ⏱️ 提交 time.txt 到仓库(用于解决 60 天无文件变化的限制)
       - name: Commit time.txt to repo

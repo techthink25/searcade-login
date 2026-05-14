@@ -10,46 +10,35 @@ from seleniumbase import SB
 from pyvirtualdisplay import Display
 
 """
-批量登录 https://searcade.com （通过 userveria SSO）
+批量登录 https://searcade.com （通过 userveria SSO + OAuth）
 
 流程：
   1) 打开 https://searcade.com/en/admin/servers/<SERVER_ID>
-     - 未登录会被导向 searcade 的 “Welcome back” 页：输入 email -> 点击 Continue with email
-  2) 跳转到 userveria SSO 页 -> 输入密码 -> 提交
-  3) 跳回 searcade 的服务器控制台页，停留 4-6 秒
+     - 未登录 -> searcade 邮箱页：输入 email -> Continue with email
+  2) 跳转到 https://userveria.com/authorize/?client_id=...
+     - 输入密码 -> 提交
+     - 如出现 OAuth 同意页（Authorize / Allow），点击同意按钮
+  3) 跳回 searcade 服务器控制台页，停留 4-6 秒
   4) 返回 searcade 首页 https://searcade.com/，停留 3-5 秒
-  5) 点击退出按钮 / 或访问 /logout 路径退出
+  5) 退出（点击 logout 或访问 /logout 路径）
 
 环境变量：
-  - ACCOUNTS_BATCH（多行，英文逗号分隔，每行一套账号）
-      格式：
-        1) 不发 TG：email,password
-        2) 发 TG  ：email,password,tg_bot_token,tg_chat_id
-  - SEARCADE_SERVER_ID（可选）
-      控制台 URL 里的 server_id，默认 6927；也可以在 ACCOUNTS_BATCH 里覆盖。
-
-示例：
-export ACCOUNTS_BATCH='a1@example.com,pass1
-a2@example.com,pass2,123456:AAxxxxxx,123456789
-'
-
-备注：
-  - searcade 登录页在未登录访问受保护页面时，会显示带 email 输入框和 “Continue with email” 按钮
-    的 SSO 引导页。userveria 密码页的具体 HTML 无法提前 100% 确认，脚本对密码输入框与提交按钮
-    使用了多套候选选择器去匹配（type=password / name=password / #password 等）。
+  - ACCOUNTS_BATCH 多行账号，逗号分隔。支持 2/3/4/5 列：
+      email,password
+      email,password,server_id
+      email,password,tg_bot_token,tg_chat_id
+      email,password,server_id,tg_bot_token,tg_chat_id
+  - SEARCADE_SERVER_ID 可选，默认 6927
 """
 
 HOME_URL = "https://searcade.com/"
-# 默认服务器 ID（可被环境变量或账号行覆盖）
 DEFAULT_SERVER_ID = os.getenv("SEARCADE_SERVER_ID", "6927").strip() or "6927"
 SERVER_URL_TPL = "https://searcade.com/en/admin/servers/{server_id}"
-LOGIN_ENTRY_TPL = SERVER_URL_TPL  # 访问受保护页面会被导向登录流程
 
 SCREENSHOT_DIR = "screenshots"
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
-# ---------- 登录表单候选选择器 ----------
-# searcade 邮箱输入 + “Continue with email”
+# ---------- 选择器候选 ----------
 EMAIL_SELECTORS = [
     'input[type="email"]',
     'input[name="email"]',
@@ -64,7 +53,6 @@ CONTINUE_BTN_SELECTORS = [
     'input[type="submit"]',
 ]
 
-# userveria 密码输入 + 登录按钮
 PASSWORD_SELECTORS = [
     'input[type="password"]',
     'input[name="password"]',
@@ -72,15 +60,36 @@ PASSWORD_SELECTORS = [
     'input[autocomplete="current-password"]',
 ]
 PASSWORD_SUBMIT_SELECTORS = [
-    'button[type="submit"]',
-    'input[type="submit"]',
+    'button[type="submit"]:not([name="allow"]):not([name="deny"])',
     'button:contains("Log in")',
     'button:contains("Login")',
     'button:contains("Sign in")',
-    'button:contains("Se connecter")',  # 法语以防万一
+    'button:contains("Continue")',
+    'button[type="submit"]',
+    'input[type="submit"]',
 ]
 
-# 登出候选：优先直接访问 /logout；同时支持点击页面上的退出按钮
+# OAuth 同意 / 授权按钮（紧跟密码提交之后可能出现）
+AUTHORIZE_BTN_SELECTORS = [
+    'button[name="allow"]',
+    'button[value="allow"]',
+    'input[name="allow"]',
+    'button:contains("Authorize")',
+    'button:contains("Allow")',
+    'button:contains("Approve")',
+    'button:contains("Accept")',
+    'button:contains("Continue")',
+    'button:contains("Yes")',
+    'a:contains("Authorize")',
+    'a:contains("Allow")',
+    'a:contains("Continue")',
+    'input[type="submit"][value*="Allow" i]',
+    'input[type="submit"][value*="Authorize" i]',
+    'input[type="submit"][value*="Continue" i]',
+    'form button[type="submit"]',
+    'button[type="submit"]',
+]
+
 LOGOUT_LINK_SELECTORS = [
     'a[href$="/logout"]',
     'a[href*="/logout"]',
@@ -94,6 +103,7 @@ LOGOUT_LINK_SELECTORS = [
 LOGOUT_URL_CANDIDATES = [
     "https://searcade.com/en/logout",
     "https://searcade.com/logout",
+    "https://searcade.com/accounts/logout/",
 ]
 
 
@@ -130,12 +140,30 @@ def screenshot(sb, name: str):
         print(f"⚠️ 截图失败 {path}: {e}")
 
 
+def dump_html(sb, name: str):
+    """落盘当前页面 HTML（去除密码值），便于调试。"""
+    try:
+        html = sb.get_page_source() or ""
+        # 安全：把 password 字段的 value 干掉
+        html = re.sub(
+            r'(<input[^>]*type=["\']?password["\']?[^>]*?)\bvalue=("[^"]*"|\'[^\']*\')',
+            r"\1",
+            html,
+            flags=re.IGNORECASE,
+        )
+        path = f"{SCREENSHOT_DIR}/{name}"
+        with open(path, "w", encoding="utf-8", errors="replace") as f:
+            f.write(html)
+        print(f"📄 {path}")
+    except Exception as e:
+        print(f"⚠️ HTML 落盘失败 {name}: {e}")
+
+
 def tg_send(text: str, token: Optional[str] = None, chat_id: Optional[str] = None):
     token = (token or "").strip()
     chat_id = (chat_id or "").strip()
     if not token or not chat_id:
         return
-
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
         requests.post(
@@ -157,43 +185,26 @@ def build_accounts_from_env() -> List[Dict[str, str]]:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-
         parts = [p.strip() for p in line.split(",")]
-
-        # 支持 2 / 3 / 4 / 5 列：
-        #   email,password
-        #   email,password,server_id
-        #   email,password,tg_bot_token,tg_chat_id
-        #   email,password,server_id,tg_bot_token,tg_chat_id
         if len(parts) not in (2, 3, 4, 5):
             raise RuntimeError(
-                f"❌ ACCOUNTS_BATCH 第 {idx} 行格式不对（允许 email,password | "
-                f"email,password,server_id | email,password,tg_bot_token,tg_chat_id | "
-                f"email,password,server_id,tg_bot_token,tg_chat_id）：{raw!r}"
+                f"❌ ACCOUNTS_BATCH 第 {idx} 行格式不对：{raw!r}"
             )
-
         email, password = parts[0], parts[1]
-
         server_id = DEFAULT_SERVER_ID
         tg_token = ""
         tg_chat = ""
-
         if len(parts) == 3:
-            # email,password,server_id
             server_id = parts[2] or DEFAULT_SERVER_ID
         elif len(parts) == 4:
-            # email,password,tg_bot_token,tg_chat_id
             tg_token = parts[2]
             tg_chat = parts[3]
         elif len(parts) == 5:
-            # email,password,server_id,tg_bot_token,tg_chat_id
             server_id = parts[2] or DEFAULT_SERVER_ID
             tg_token = parts[3]
             tg_chat = parts[4]
-
         if not email or not password:
             raise RuntimeError(f"❌ ACCOUNTS_BATCH 第 {idx} 行存在空字段：{raw!r}")
-
         accounts.append(
             {
                 "email": email,
@@ -203,23 +214,19 @@ def build_accounts_from_env() -> List[Dict[str, str]]:
                 "tg_chat": tg_chat,
             }
         )
-
     if not accounts:
-        raise RuntimeError("❌ ACCOUNTS_BATCH 里没有有效账号行（空行/注释行不算）")
-
+        raise RuntimeError("❌ ACCOUNTS_BATCH 里没有有效账号行")
     return accounts
 
 
-# ---------- 通用辅助：尝试多组选择器 ----------
+# ---------- 通用辅助 ----------
 def _first_visible(sb, selectors: List[str], timeout_each: float = 1.5) -> Optional[str]:
-    """返回第一个可见的选择器；全都不可见则返回 None。"""
     for sel in selectors:
         try:
             if sb.is_element_visible(sel):
                 return sel
         except Exception:
             continue
-    # 再用 wait 轮一轮（每个短等待）
     for sel in selectors:
         try:
             sb.wait_for_element_visible(sel, timeout=timeout_each)
@@ -259,57 +266,41 @@ def _is_on_server_page(sb: SB, server_id: str) -> bool:
     return f"/admin/servers/{server_id}" in url
 
 
-def _is_on_login_flow(sb: SB) -> bool:
-    """判断当前是否还在登录流程（searcade 邮箱页 / userveria 密码页）。"""
-    if _first_visible(sb, EMAIL_SELECTORS):
-        return True
-    if _first_visible(sb, PASSWORD_SELECTORS):
-        return True
-    url = _current_url(sb).lower()
-    if "userveria" in url:
-        return True
-    return False
+def _is_on_userveria_authorize(sb: SB) -> bool:
+    return "userveria.com/authorize" in _current_url(sb).lower()
 
 
 # ---------- 登录步骤 ----------
 def _do_email_step(sb: SB, email: str) -> bool:
-    """searcade 邮箱页：输入 email -> Continue with email。"""
     email_sel = _first_visible(sb, EMAIL_SELECTORS, timeout_each=3)
     if not email_sel:
         return False
-
     try:
         sb.clear(email_sel)
         sb.type(email_sel, email)
     except Exception:
         return False
-
     btn_sel = _first_visible(sb, CONTINUE_BTN_SELECTORS, timeout_each=2)
     try:
         if btn_sel:
             sb.click(btn_sel)
         else:
-            # 兜底：回车提交
             sb.send_keys(email_sel, "\n")
     except Exception:
         return False
-
     time.sleep(3)
     return True
 
 
 def _do_password_step(sb: SB, password: str) -> bool:
-    """userveria 密码页：输入密码 -> 提交。"""
     pwd_sel = _first_visible(sb, PASSWORD_SELECTORS, timeout_each=20)
     if not pwd_sel:
         return False
-
     try:
         sb.clear(pwd_sel)
         sb.type(pwd_sel, password)
     except Exception:
         return False
-
     btn_sel = _first_visible(sb, PASSWORD_SUBMIT_SELECTORS, timeout_each=3)
     try:
         if btn_sel:
@@ -318,13 +309,51 @@ def _do_password_step(sb: SB, password: str) -> bool:
             sb.send_keys(pwd_sel, "\n")
     except Exception:
         return False
-
     time.sleep(4)
     return True
 
 
+def _try_oauth_consent(sb: SB, server_id: str) -> bool:
+    """
+    OAuth 授权同意页处理：如果停在 userveria.com/authorize 上，尝试点 Authorize/Allow。
+    """
+    if not _is_on_userveria_authorize(sb):
+        return False
+
+    print("🔐 检测到 OAuth authorize 页，尝试点击同意按钮...")
+    dump_html(sb, f"02b_authorize_{int(time.time())}.html")
+    screenshot(sb, f"02b_authorize_{int(time.time())}.png")
+
+    sel = _first_visible(sb, AUTHORIZE_BTN_SELECTORS, timeout_each=3)
+    if sel:
+        try:
+            print(f"🔘 点击同意按钮：{sel}")
+            sb.scroll_to(sel)
+            time.sleep(0.3)
+            sb.click(sel)
+            time.sleep(4)
+            return True
+        except Exception as e:
+            print(f"⚠️ 同意按钮点击失败：{e}")
+
+    # 兜底：在 authorize 页上找所有 form 提交一遍
+    try:
+        forms = sb.find_elements("form")
+        print(f"🔎 authorize 页上找到 {len(forms)} 个 form，尝试提交第一个")
+        if forms:
+            try:
+                sb.execute_script("arguments[0].submit();", forms[0])
+                time.sleep(4)
+                return True
+            except Exception as e:
+                print(f"⚠️ form.submit() 失败：{e}")
+    except Exception:
+        pass
+
+    return False
+
+
 def _logout(sb: SB) -> bool:
-    """尝试退出：优先点击页面上的 logout 链接 / 按钮；失败则直接访问 /logout URL。"""
     sel = _first_visible(sb, LOGOUT_LINK_SELECTORS, timeout_each=2)
     if sel:
         try:
@@ -332,18 +361,14 @@ def _logout(sb: SB) -> bool:
             time.sleep(0.3)
             sb.click(sel)
             time.sleep(3)
-            # 退出后通常会出现邮箱输入框或跳回登录页
             if _first_visible(sb, EMAIL_SELECTORS, timeout_each=3):
                 return True
             url_now = _current_url(sb).lower()
-            if "login" in url_now or "logout" in url_now or "searcade.com" in url_now and "/admin/" not in url_now:
-                # 兜底判定：不再在受保护的 /admin/ 下就算退出成功
-                if "/admin/" not in url_now:
-                    return True
+            if "/admin/" not in url_now:
+                return True
         except Exception:
             pass
 
-    # 直接访问 /logout
     for url in LOGOUT_URL_CANDIDATES:
         try:
             sb.open(url)
@@ -355,60 +380,60 @@ def _logout(sb: SB) -> bool:
                 return True
         except Exception:
             continue
-
     return False
 
 
 def login_then_flow_one_account(
     email: str, password: str, server_id: str
 ) -> Tuple[str, bool, str, Optional[str], bool]:
-    """
-    返回：
-      (status, has_cf_clearance, current_url, server_id_used, logout_ok)
-
-    status:
-      - "OK"   登录成功（无论 logout 是否成功）
-      - "FAIL" 登录失败
-    """
     server_url = SERVER_URL_TPL.format(server_id=server_id)
 
     with SB(uc=True, locale="en", test=True) as sb:
         print("🚀 浏览器启动（UC Mode）")
 
-        # 1) 直接访问受保护的服务器控制台页，触发登录流程
         sb.uc_open_with_reconnect(server_url, reconnect_time=5.0)
         time.sleep(2)
-
         _try_click_captcha(sb, "访问控制台前")
 
-        # 2) 如果已经登录（cookie 未过期），直接就在 server 页
         if _is_on_server_page(sb, server_id):
             print("✅ 已处于登录状态，直接进入 server 页")
         else:
-            # 3) searcade 邮箱页
             screenshot(sb, f"01_email_page_{int(time.time())}.png")
+            dump_html(sb, f"01_email_page_{int(time.time())}.html")
             if not _do_email_step(sb, email):
                 screenshot(sb, f"email_step_failed_{int(time.time())}.png")
+                dump_html(sb, f"email_step_failed_{int(time.time())}.html")
                 return "FAIL", _has_cf_clearance(sb), _current_url(sb), server_id, False
 
             _try_click_captcha(sb, "邮箱提交后")
 
-            # 4) userveria 密码页
             screenshot(sb, f"02_password_page_{int(time.time())}.png")
+            dump_html(sb, f"02_password_page_{int(time.time())}.html")
             if not _do_password_step(sb, password):
                 screenshot(sb, f"password_step_failed_{int(time.time())}.png")
+                dump_html(sb, f"password_step_failed_{int(time.time())}.html")
                 return "FAIL", _has_cf_clearance(sb), _current_url(sb), server_id, False
 
             _try_click_captcha(sb, "密码提交后")
 
-            # 5) 等待跳回 searcade 服务器控制台
+            # 等回到 searcade 服务器页；中间如果停在 OAuth authorize 页，尝试点同意
             ok = False
-            for _ in range(20):
+            for i in range(30):
                 if _is_on_server_page(sb, server_id):
                     ok = True
                     break
-                if not _is_on_login_flow(sb) and "searcade.com" in _current_url(sb).lower():
-                    # 兜底：跳回了 searcade，但未在 server 页 -> 主动进 server 页
+
+                # 如果停在 userveria/authorize -> 试点同意按钮
+                if _is_on_userveria_authorize(sb):
+                    _try_oauth_consent(sb, server_id)
+                    time.sleep(2)
+                    if _is_on_server_page(sb, server_id):
+                        ok = True
+                        break
+
+                # 如果回到 searcade.com 但不在 server 页，主动进 server 页
+                cur = _current_url(sb).lower()
+                if "searcade.com" in cur and "/admin/servers/" not in cur and "userveria" not in cur:
                     try:
                         sb.open(server_url)
                         time.sleep(3)
@@ -417,19 +442,19 @@ def login_then_flow_one_account(
                             break
                     except Exception:
                         pass
+
                 time.sleep(1)
 
             if not ok:
                 screenshot(sb, f"post_login_not_on_server_{int(time.time())}.png")
+                dump_html(sb, f"post_login_not_on_server_{int(time.time())}.html")
                 return "FAIL", _has_cf_clearance(sb), _current_url(sb), server_id, False
 
-        # 6) 服务器页停留 4-6 秒
         screenshot(sb, f"03_server_page_{int(time.time())}.png")
         stay1 = random.randint(4, 6)
         print(f"⏳ 服务器页停留 {stay1} 秒...")
         time.sleep(stay1)
 
-        # 7) 返回首页
         try:
             print(f"↩️ 返回首页：{HOME_URL}")
             sb.open(HOME_URL)
@@ -443,7 +468,6 @@ def login_then_flow_one_account(
         time.sleep(stay2)
         screenshot(sb, f"04_home_page_{int(time.time())}.png")
 
-        # 8) 退出
         logout_ok = _logout(sb)
         screenshot(sb, f"05_after_logout_{int(time.time())}.png")
 
@@ -469,7 +493,6 @@ def main():
             tg_chat = (acc.get("tg_chat") or "").strip()
             if tg_token and tg_chat:
                 tg_dests.add((tg_token, tg_chat))
-
             safe_email = mask_email_keep_domain(email)
 
             print("\n" + "=" * 70)
@@ -512,7 +535,6 @@ def main():
                 print(msg)
                 tg_send(msg, tg_token, tg_chat)
 
-            # 账号之间冷却
             time.sleep(5)
             if i < len(accounts):
                 time.sleep(5)
